@@ -1,0 +1,20 @@
+# docker/Dockerfile.dockerignore
+.git
+.github
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.env
+.env.*
+*.db
+
+# not needed at runtime
+app/test_*.py
+app/requirements-dev.txt
+docs
+infra
+.terraform
+*.tfstate*
+*.tfvars
+docker-compose*.yml
