@@ -1,19 +1,178 @@
+# Destination: .github/workflows/ci.yml
 name: ci
+
 on:
   pull_request:
   push:
     branches: [main]
 
-permissions:
-  contents: read
+# Deny by default; each job asks for exactly what it needs.
+permissions: {}
+
+# Cancel superseded runs on PRs, never on main.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Every third-party action is pinned to a full commit SHA (the trailing comment
+# is the human-readable version, and what Dependabot keeps updated).
+# Never use @master/@main/@v1 style refs for actions that run with your token.
 
 jobs:
+  # ------------------------------------------------------------------ tests
   test:
+    name: test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - run: pip install -r app/requirements-dev.txt
       - run: cd app && pytest
+
+  # ---------------------------------------------------------- secret scanning
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read # lets the action list the commits in a PR
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history, so old leaked secrets are found too
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false" # keeps the token read-only
+          # Only needed if this repo is owned by a GitHub *organization*:
+          # GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  # ------------------------------------------------------------------- SAST
+  sast:
+    name: sast
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # needed only for the SARIF upload
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: pip install -r ci/requirements.txt
+
+      # Pass 1: report everything (all severities) to the Security tab. Never fails.
+      - name: Semgrep (report)
+        run: semgrep scan --config p/ci --config p/python --sarif --output semgrep.sarif
+      - name: Upload SARIF
+        if: ${{ !cancelled() && github.actor != 'dependabot[bot]' && github.event.pull_request.head.repo.fork != true }}
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      # Pass 2: the gate. Only ERROR-severity findings fail the build.
+      - name: Semgrep (gate)
+        run: semgrep scan --config p/ci --config p/python --severity ERROR --error
+
+  # ------------------------------------------------------ dependency scanning
+  dependencies:
+    name: dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Pass 1: report MEDIUM and up to the Security tab. Never fails.
+      - name: Trivy fs (report)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-fs.sarif
+          severity: MEDIUM,HIGH,CRITICAL
+          limit-severities-for-sarif: true
+      - name: Upload SARIF
+        if: ${{ !cancelled() && github.actor != 'dependabot[bot]' && github.event.pull_request.head.repo.fork != true }}
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      # Pass 2: the gate. Fixable HIGH/CRITICAL fails the build.
+      - name: Trivy fs (gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+
+  # ------------------------------------------------------- container scanning
+  container:
+    name: container
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      IMAGE: notes-api:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Build only. Nothing is pushed anywhere in Phase 2.
+      - name: Build image
+        run: docker build -f docker/Dockerfile -t "$IMAGE" .
+
+      - name: Trivy image (report)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-image.sarif
+          severity: MEDIUM,HIGH,CRITICAL
+          limit-severities-for-sarif: true
+      - name: Upload SARIF
+        if: ${{ !cancelled() && github.actor != 'dependabot[bot]' && github.event.pull_request.head.repo.fork != true }}
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Trivy image (gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+
+# Private repo without GitHub Code Security? Code Scanning uploads will fail.
+# Delete the three "Upload SARIF" steps; the gate steps still work and print
+# findings in the job log.

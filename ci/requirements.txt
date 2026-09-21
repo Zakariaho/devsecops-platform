@@ -1,0 +1,3 @@
+# Destination: ci/requirements.txt
+# Tools the pipeline itself installs. Pinned, and watched by Dependabot.
+semgrep==1.177.0
